@@ -26,7 +26,14 @@ pip install .
 
 The main script of the project is `sweep.py`. It can be run from the command line using the following command:
 ```
-python sweep.py --model_sizes=gpt2,gpt2-medium
+python sweep.py --model_sizes=gpt2,gpt2-medium,gpt2-large,gpt2-xl --ds_name boolq
+```
+
+```
+python sweep_mix_w2s.py \
+  --weak_model_sizes gpt2,gpt2-medium,gpt2-large \
+  --strong_model_sizes gpt2-medium,gpt2-large,gpt2-xl \
+  --ds_names boolq
 ```
 
 In addition to `--model_sizes`, `sweep.py` takes in almost all of the arguments that `train_simple.py` takes (e.g.

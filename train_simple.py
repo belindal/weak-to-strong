@@ -7,12 +7,12 @@ from typing import Dict, List, Optional
 import fire
 import numpy as np
 import torch
-from datasets import load_dataset, load_from_disk
+from datasets import load_from_disk
 
 import weak_to_strong.logger as logger
 from weak_to_strong.common import get_tokenizer
 from weak_to_strong.datasets import (VALID_DATASETS, load_dataset,
-                                     tokenize_dataset)
+                                     tokenize_dataset, mix_labels)
 from weak_to_strong.loss import logconf_loss_fn, product_loss_fn, xent_loss
 from weak_to_strong.train import ModelConfig, train_and_save_model
 
@@ -156,7 +156,7 @@ def main(
     seed: int = 0,
     minibatch_size_per_device: Optional[float] = None,
     train_with_dropout: bool = False,
-    results_folder: str = "/tmp/results",
+    results_folder: str = "/workspace/weak-to-strong/results",
     linear_probe: bool = False,
     lr_schedule: str = "cosine_anneal",
     # Note: you can pass either weak_model_size or weak_labels_path. If you pass
@@ -170,10 +170,19 @@ def main(
     # still do final evals (which requires eval_every to be set to a non-zero, non-None value)
     eval_every: int = 1000000,
     sync_command: Optional[str] = None,
+    # Fraction of training examples to replace with strong (ground truth) labels.
+    # The remaining (1 - mix_ratio) fraction use weak model labels.
+    mix_ratio: Optional[float] = None,
+    # How to select which examples get strong labels: "random" or "active".
+    # "active": replace the mix_ratio fraction with lowest weak-model confidence.
+    mix_selection: str = "random",
 ):
     # this is per device!
     if minibatch_size_per_device is None:
         minibatch_size_per_device = 1
+    if mix_ratio is not None:
+        assert 0.0 <= mix_ratio <= 1.0, f"mix_ratio must be in [0, 1], got {mix_ratio}"
+
     assert ds_name in VALID_DATASETS, f"Unknown dataset {ds_name} not in {VALID_DATASETS}"
     assert (
         weak_model_size is None or weak_labels_path is None
@@ -213,11 +222,16 @@ def main(
         "eval_every": eval_every,
         # "sweep_subfolder": sweep_subfolder,
     }
+    if mix_ratio is not None:
+        config["mix_ratio"] = mix_ratio
+        config["mix_selection"] = mix_selection
 
     if weak_model_size is not None:
         weak_model_config = config.copy()
         weak_model_config["model_size"] = weak_model_size
         weak_model_config["loss"] = "xent"
+        del weak_model_config["mix_ratio"]
+        del weak_model_config["mix_selection"]
         if use_default_lr:
             weak_model_config["lr"] = MODELS_DICT[weak_model_size].default_lr
 
@@ -244,6 +258,10 @@ def main(
     else:
         if not weak_labels_path.endswith("weak_labels"):
             weak_labels_path = weak_labels_path + "/weak_labels"
+        if mix_ratio is not None:  # and mix_ratio != 1.0 and mix_ratio != 0.0:
+            print(
+                f"Training mix model, size {model_size} on {mix_ratio:.0%} strong ({mix_selection}) + {1-mix_ratio:.0%} weak labels from weak model {weak_model_size}"
+            )
         if sync_command is not None:
             sync_command_list = sync_command.split(" ")
             sync_command_list.extend(
@@ -254,6 +272,8 @@ def main(
             if result.returncode != 0:
                 raise RuntimeError(f"Sync command failed with return code {result.returncode}")
         train1_ds = load_from_disk(weak_labels_path)
+        if mix_ratio is not None:
+            train1_ds = mix_labels(train1_ds, strong_frac=mix_ratio, seed=seed, selection=mix_selection)
         train2_ds = None
 
         weak_model_config = json.load(open(weak_labels_path.replace("weak_labels", "config.json")))
@@ -300,14 +320,15 @@ def main(
     if weak_ds is not None:
         weak_ds.save_to_disk(save_path + "/" + "weak_labels")
 
+
     acc = np.mean([x["acc"] for x in test_results])
     res_dict = {"accuracy": acc}
     print("accuracy:", acc)
 
-    with open(os.path.join(save_path, f"config.json"), "w") as f:
+    with open(os.path.join(save_path, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
 
-    with open(os.path.join(save_path, f"results_summary.json"), "w") as f:
+    with open(os.path.join(save_path, "results_summary.json"), "w") as f:
         json.dump(res_dict, f, indent=2)
 
     if sync_command is not None:
@@ -321,6 +342,8 @@ def main(
                 raise RuntimeError(f"Sync command failed with return code {result.returncode}")
         except Exception as e:
             raise RuntimeError("Failed to sync results to remote storage.") from e
+
+    return res_dict
 
 
 if __name__ == "__main__":

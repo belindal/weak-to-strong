@@ -16,6 +16,7 @@ from weak_to_strong.common import clear_mem
 from weak_to_strong.eval import eval_model_acc
 from weak_to_strong.loss import xent_loss
 from weak_to_strong.model import TransformerWithHead
+from tqdm import tqdm
 
 
 @dataclass
@@ -88,73 +89,73 @@ def train_model(
     # a bit more data than other ones, but hopefully should not be too big of a deal.
     io_device = model.device if hasattr(model, "device") else 0
 
-    while step < nsteps:
-        loss_tot = 0
-        if eval_every and (step + 1) % eval_every == 0:
-            eval_results = eval_model_acc(model, eval_ds, eval_batch_size)
-            if gradient_checkpointing:
-                (
-                    model if hasattr(model, "gradient_checkpointing_enable") else model.module
-                ).gradient_checkpointing_enable()
-            if train_with_dropout:
-                model.train()
-            eval_accs = np.mean([r["acc"] for r in eval_results])
-            eval_acc_dict[step] = eval_accs
-            logger.logkv("eval_accuracy", eval_accs)
-        all_logits = []
-        all_labels = []
-        for i in range(batch_size // minibatch_size):
-            try:
-                mbatch = [next(it) for _ in range(minibatch_size)]
-            except StopIteration:
-                break
-            input_ids = (
-                torch.nn.utils.rnn.pad_sequence([torch.tensor(ex["input_ids"]) for ex in mbatch])
-                .transpose(
-                    0,
-                    1,
+    with tqdm(total=nsteps, desc="Training") as pbar:
+        while step < nsteps:
+            loss_tot = 0
+            if eval_every and (step + 1) % eval_every == 0:
+                eval_results = eval_model_acc(model, eval_ds, eval_batch_size)
+                if gradient_checkpointing:
+                    (
+                        model if hasattr(model, "gradient_checkpointing_enable") else model.module
+                    ).gradient_checkpointing_enable()
+                if train_with_dropout:
+                    model.train()
+                eval_accs = np.mean([r["acc"] for r in eval_results])
+                eval_acc_dict[step] = eval_accs
+                logger.logkv("eval_accuracy", eval_accs)
+            all_logits = []
+            all_labels = []
+            for i in range(batch_size // minibatch_size):
+                try:
+                    mbatch = [next(it) for _ in range(minibatch_size)]
+                except StopIteration:
+                    break
+                input_ids = (
+                    torch.nn.utils.rnn.pad_sequence([torch.tensor(ex["input_ids"]) for ex in mbatch])
+                    .transpose(
+                        0,
+                        1,
+                    )
+                    .to(io_device)
                 )
-                .to(io_device)
-            )
-            labels = torch.tensor([ex["soft_label"] for ex in mbatch]).to(io_device)
+                labels = torch.tensor([ex["soft_label"] for ex in mbatch]).to(io_device)
 
-            logits = model(input_ids)
+                logits = model(input_ids)
 
-            all_logits.extend(logits.to(io_device))
-            all_labels.extend(labels)
-        all_logits = torch.stack(all_logits)
-        all_labels = torch.stack(all_labels)
-        loss = loss_fn(all_logits, all_labels, step_frac=step / nsteps)
-        loss_tot += loss.item()
-        loss.backward()
-        losses.append(loss_tot)
-        accuracies.append(
-            torch.mean(
-                (torch.argmax(all_logits, dim=1) == torch.argmax(all_labels, dim=1)).to(
-                    torch.float32
-                )
-            ).item()
-        )
-        logger.logkvs(
-            {
-                "step": step,
-                "progress": step / nsteps,
-                "loss": loss_tot,
-                "train_accuracy": accuracies[-1],
-                "lr": lr_scheduler.get_last_lr()[0],
-            }
-        )
-        optimizer.step()
-        optimizer.zero_grad()
-        lr_scheduler.step()
-        if log_every and step % log_every == 0:
-            print(
-                f"Step: {step}/{nsteps} Recent losses: {np.mean(losses)} {np.mean(accuracies)} {len(losses)}"
+                all_logits.extend(logits.to(io_device))
+                all_labels.extend(labels)
+            all_logits = torch.stack(all_logits)
+            all_labels = torch.stack(all_labels)
+            loss = loss_fn(all_logits, all_labels, step_frac=step / nsteps)
+            loss_tot += loss.item()
+            loss.backward()
+            losses.append(loss_tot)
+            accuracies.append(
+                torch.mean(
+                    (torch.argmax(all_logits, dim=1) == torch.argmax(all_labels, dim=1)).to(
+                        torch.float32
+                    )
+                ).item()
             )
-            losses = []
-            accuracies = []
-        step += 1
-        logger.dumpkvs()
+            logger.logkvs(
+                {
+                    "step": step,
+                    "progress": step / nsteps,
+                    "loss": loss_tot,
+                    "train_accuracy": accuracies[-1],
+                    "lr": lr_scheduler.get_last_lr()[0],
+                }
+            )
+            optimizer.step()
+            optimizer.zero_grad()
+            lr_scheduler.step()
+            step += 1
+            pbar.update(1)
+            pbar.set_postfix(loss=f"{loss_tot:.4f}", acc=f"{accuracies[-1]:.4f}")
+            if log_every and step % log_every == 0:
+                losses = []
+                accuracies = []
+            logger.dumpkvs()
     final_eval_results = None
     if eval_every:
         print("Final evaluation:")
@@ -195,7 +196,7 @@ def train_and_save_model(
     custom_kwargs = model_config.custom_kwargs or {}
 
     def maybe_load_model(model):
-        if os.path.exists(os.path.join(save_path, "results.pkl")) and not force_retrain:
+        if os.path.exists(os.path.join(save_path, "pytorch_model.bin")) and not force_retrain:
             print("loading from", save_path)
             checkpoint_path = os.path.join(save_path, "pytorch_model.bin")
             if not os.path.exists(checkpoint_path):
@@ -207,7 +208,7 @@ def train_and_save_model(
                     k.replace("transformer.module", "transformer"): v
                     for (k, v) in state_dict.items()
                 }
-                custom_kwargs["state_dict"] = state_dict
+                model.load_state_dict(state_dict, strict=False)
             return True
         return False
 
@@ -269,7 +270,7 @@ def train_and_save_model(
         if save_path:
             # Note: If the model is wrapped by DataParallel, we need to unwrap it before saving
             (model if hasattr(model, "save_pretrained") else model.module).save_pretrained(
-                save_path
+                save_path, safe_serialization=False
             )
             print("saved", save_path)
 

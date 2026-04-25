@@ -1,7 +1,8 @@
-import datasets
 import numpy as np
 import torch
+from datasets import Dataset
 from torch import nn
+from tqdm import tqdm
 
 
 def to_batch(x, batch_size):
@@ -14,7 +15,7 @@ def unpack(x):
     return x.detach().float().cpu().numpy().tolist()
 
 
-def eval_model_acc(model: nn.Module, ds: datasets.Dataset, eval_batch_size: int = 16) -> None:
+def eval_model_acc(model: nn.Module, ds: Dataset, eval_batch_size: int = 16) -> Dataset:
     """
     This function evaluates the accuracy of a given model on a given dataset.
 
@@ -32,7 +33,7 @@ def eval_model_acc(model: nn.Module, ds: datasets.Dataset, eval_batch_size: int 
     with torch.no_grad():
         results = []
         # for ex in ds:
-        for batch in to_batch(ds, eval_batch_size):
+        for batch in tqdm(to_batch(ds, eval_batch_size), desc="Evaluating"):
             # pad input_ids to common length
             input_ids = torch.nn.utils.rnn.pad_sequence(
                 [torch.tensor(ex) for ex in batch["input_ids"]], batch_first=True
@@ -66,4 +67,4 @@ def eval_model_acc(model: nn.Module, ds: datasets.Dataset, eval_batch_size: int 
         accs = [r["acc"] for r in results]
         print("Accuracy:", np.mean(accs), "+/-", np.std(accs) / np.sqrt(len(accs)))
 
-        return datasets.Dataset.from_list(results)
+        return Dataset.from_list(results)

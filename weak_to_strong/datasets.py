@@ -5,6 +5,50 @@ from typing import Any, Callable, Optional
 
 from datasets import Dataset as HfDataset
 from datasets import load_dataset as hf_load_dataset
+import random
+
+
+def mix_labels(
+    weak_ds: HfDataset,
+    strong_frac: float,
+    seed: int = 0,
+    selection: str = "random",
+) -> HfDataset:
+    """Replace soft_label with one-hot ground truth for strong_frac fraction of examples.
+
+    Args:
+        weak_ds: Dataset with soft_label (weak model predictions) and gt_label (ground truth int).
+        strong_frac: Fraction of examples in [0, 1] to replace with strong (ground truth) labels.
+        seed: Random seed (used for "random" selection; ignored for "active").
+        selection: How to choose which examples get strong labels.
+            "random" — uniformly sample strong_frac of examples.
+            "active" — find the confidence threshold that covers strong_frac of samples
+                       (max(soft_label) per example), then replace all examples whose
+                       weak model confidence falls below that threshold.
+    """
+    assert selection in ("random", "active"), f"Unknown selection {selection!r}, expected 'random' or 'active'"
+    n = len(weak_ds)
+    k = round(strong_frac * n)
+
+    if selection == "random":
+        strong_indices = random.sample(range(n), k)
+        print(f"Random selection: replacing {k}/{n} examples with strong labels")
+    else:  # active
+        confidences = [max(ex["soft_label"]) for ex in weak_ds]
+        # Sort indices by confidence ascending; take the bottom strong_frac fraction.
+        sorted_by_conf = sorted(range(n), key=lambda i: confidences[i])
+        strong_indices = set(sorted_by_conf[:k])
+        if k > 0:
+            threshold = confidences[sorted_by_conf[k - 1]]
+            print(f"Active selection: confidence threshold = {threshold:.4f}, replacing {k}/{n} examples")
+
+    def replace_label(ex, idx):
+        if idx in strong_indices:
+            gt = ex["gt_label"]
+            return {"soft_label": [1 - float(gt), float(gt)]}
+        return {}
+
+    return weak_ds.map(replace_label, with_indices=True)
 
 
 @dataclass

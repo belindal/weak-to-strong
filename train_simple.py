@@ -140,6 +140,36 @@ def _compute_uncertainty(soft_labels: np.ndarray, strategy: str, seed: int = 0) 
     raise ValueError(f"Unknown al_strategy {strategy!r}; choose from {VALID_AL_STRATEGIES}")
 
 
+def _score_pool(
+    model_config: "ModelConfig",
+    checkpoint: str,
+    ds,
+    eval_batch_size: int,
+):
+    """Load a model from checkpoint and return eval_model_acc results for ds."""
+    custom_kwargs = model_config.custom_kwargs or {}
+    if model_config.model_parallel:
+        model = TransformerWithHead.from_pretrained(
+            model_config.name, num_labels=2, device_map="auto", **custom_kwargs
+        )
+    else:
+        model = TransformerWithHead.from_pretrained(
+            model_config.name, num_labels=2, **custom_kwargs
+        ).to("cuda")
+    ckpt_bin = os.path.join(checkpoint, "pytorch_model.bin")
+    if os.path.exists(ckpt_bin):
+        state_dict = torch.load(ckpt_bin, map_location="cpu")
+        state_dict = {
+            k.replace("transformer.module", "transformer"): v
+            for k, v in state_dict.items()
+        }
+        model.load_state_dict(state_dict, strict=False)
+    scored = eval_model_acc(model, ds, eval_batch_size)
+    del model
+    clear_mem()
+    return scored
+
+
 def get_config_foldername(config: dict) -> str:
     def shorten_key(key: str) -> str:
         return "".join(word[0] for word in key.split("_"))
@@ -172,7 +202,7 @@ def main(
     epochs: int = 2,
     force_retrain: bool = False,
     seed: int = 0,
-    minibatch_size_per_device: Optional[float] = None,
+    minibatch_size_per_device: Optional[int] = None,
     train_with_dropout: bool = False,
     results_folder: str = "/workspace/weak-to-strong/results",
     linear_probe: bool = False,
@@ -200,6 +230,10 @@ def main(
     # Requires both --resume_from_checkpoint and --mix_ratio to be set.
     # Choices: least_confidence | entropy | margin | random
     al_strategy: Optional[str] = None,
+    # Number of active learning rounds. Each round reveals mix_ratio/n_al_rounds
+    # GT labels, trains, then re-scores the remaining unlabeled pool.
+    # Requires al_strategy to be set when > 1.
+    n_al_rounds: int = 1,
 ):
     # this is per device!
     if minibatch_size_per_device is None:
@@ -211,6 +245,8 @@ def main(
         assert mix_ratio is not None, "al_strategy requires --mix_ratio to set the GT-label budget"
         assert weak_labels_path is not None or weak_model_size is not None, \
             "al_strategy requires weak labels (--weak_labels_path or --weak_model_size)"
+    if n_al_rounds > 1:
+        assert al_strategy is not None, "n_al_rounds > 1 requires --al_strategy"
 
     assert ds_name in VALID_DATASETS, f"Unknown dataset {ds_name} not in {VALID_DATASETS}"
     assert (
@@ -255,6 +291,8 @@ def main(
         config["mix_ratio"] = mix_ratio
         if al_strategy is not None:
             config["al_strategy"] = al_strategy
+            if n_al_rounds > 1:
+                config["n_al_rounds"] = n_al_rounds
         else:
             config["mix_selection"] = mix_selection
 
@@ -267,6 +305,8 @@ def main(
             del weak_model_config["mix_selection"]
         if "al_strategy" in weak_model_config:
             del weak_model_config["al_strategy"]
+        if "n_al_rounds" in weak_model_config:
+            del weak_model_config["n_al_rounds"]
         if use_default_lr:
             weak_model_config["lr"] = MODELS_DICT[weak_model_size].default_lr
 
@@ -323,7 +363,7 @@ def main(
         config_name = get_config_foldername(config)
         if al_strategy is not None and resume_from_checkpoint is None:
             w2s_base_config = {k: v for k, v in config.items()
-                               if k not in ("mix_ratio", "al_strategy", "mix_selection")}
+                               if k not in ("mix_ratio", "al_strategy", "mix_selection", "n_al_rounds")}
             resume_from_checkpoint = os.path.join(
                 results_folder, sweep_subfolder, get_config_foldername(w2s_base_config)
             )
@@ -340,63 +380,115 @@ def main(
     # Tokenize datasets
     tokenizer = get_tokenizer(model_config.name)
 
-    al_scores = None
-    if al_strategy is not None:
-        # Either passed explicitly or inferred from the W2S base config path above.
-        assert resume_from_checkpoint is not None, "Could not infer resume_from_checkpoint; pass it explicitly"
-        assert mix_ratio is not None
-        # Score the pool with the strong model checkpoint to get per-example uncertainty.
-        tokenized_for_scoring = tokenize_dataset(train1_ds, tokenizer, max_ctx)
-        custom_kwargs = model_config.custom_kwargs or {}
-        if model_config.model_parallel:
-            score_model = TransformerWithHead.from_pretrained(
-                model_config.name, num_labels=2, device_map="auto", **custom_kwargs
-            )
-        else:
-            score_model = TransformerWithHead.from_pretrained(
-                model_config.name, num_labels=2, **custom_kwargs
-            ).to("cuda")
-        ckpt_bin = os.path.join(resume_from_checkpoint, "pytorch_model.bin")
-        if os.path.exists(ckpt_bin):
-            state_dict = torch.load(ckpt_bin, map_location="cpu")
-            state_dict = {
-                k.replace("transformer.module", "transformer"): v
-                for k, v in state_dict.items()
-            }
-            score_model.load_state_dict(state_dict, strict=False)
-        scored = eval_model_acc(score_model, tokenized_for_scoring, eval_batch_size)
-        del score_model, tokenized_for_scoring
-        clear_mem()
-        al_scores = _compute_uncertainty(np.array(scored["soft_label"]), al_strategy, seed=seed)
-        train1_ds = mix_labels(train1_ds, strong_frac=mix_ratio, seed=seed, selection="strong_active", scores=al_scores)
-
-    train1_ds = tokenize_dataset(train1_ds, tokenizer, max_ctx)
+    # Tokenize shared eval datasets before branching (needed by all training paths).
     test_ds = tokenize_dataset(test_ds, tokenizer, max_ctx)
     if train2_ds:
         train2_ds = tokenize_dataset(train2_ds, tokenizer, max_ctx)
-
     loss_fn = loss_dict[loss]
-    print(f"Training model model, size {model_size}")
-    test_results, weak_ds = train_and_save_model(
-        model_config,
-        train1_ds,
-        test_ds,
-        inference_ds=train2_ds,
-        batch_size=batch_size,
-        save_path=save_path,
-        loss_fn=loss_fn,
-        lr=lr,
-        epochs=epochs,
-        force_retrain=force_retrain,
-        eval_batch_size=eval_batch_size,
-        minibatch_size_per_device=minibatch_size_per_device,
-        train_with_dropout=train_with_dropout,
-        linear_probe=linear_probe,
-        lr_schedule=lr_schedule,
-        optimizer_name=optim,
-        eval_every=eval_every,
-        resume_from_checkpoint=resume_from_checkpoint,
-    )
+
+    if al_strategy is not None:
+        # AL path: score → label top-k → train, repeated n_al_rounds times.
+        # n_al_rounds=1 is the single-round case.
+        assert resume_from_checkpoint is not None, "Could not infer resume_from_checkpoint; pass it explicitly"
+        assert mix_ratio is not None
+
+        train1_tok = tokenize_dataset(train1_ds, tokenizer, max_ctx)
+        n_pool = len(train1_tok)
+        per_round_k = max(1, round((mix_ratio / n_al_rounds) * n_pool))
+        labeled_indices: set = set()
+        current_checkpoint = resume_from_checkpoint
+
+        if n_al_rounds > 1:
+            print(
+                f"\nMulti-round AL: {n_al_rounds} rounds × {per_round_k} labels/round "
+                f"= {per_round_k * n_al_rounds}/{n_pool} ({mix_ratio:.0%} budget), strategy={al_strategy}"
+            )
+
+        for round_idx in range(n_al_rounds):
+            is_last = round_idx == n_al_rounds - 1
+            round_save = save_path if is_last else os.path.join(save_path, f"round_{round_idx + 1:02d}")
+
+            if n_al_rounds > 1:
+                print(f"\n{'='*50}")
+                print(f"AL Round {round_idx + 1}/{n_al_rounds}  |  scoring {n_pool - len(labeled_indices)} unlabeled examples")
+
+            unlabeled_mask = [i for i in range(n_pool) if i not in labeled_indices]
+            unlabeled_tok = train1_tok.select(unlabeled_mask)
+            scored = _score_pool(model_config, current_checkpoint, unlabeled_tok, eval_batch_size)
+
+            round_scores = _compute_uncertainty(
+                np.array(scored["soft_label"]), al_strategy, seed=seed + round_idx
+            )
+            new_labeled = {unlabeled_mask[i] for i in np.argsort(-round_scores)[:per_round_k]}
+            labeled_indices |= new_labeled
+            if n_al_rounds > 1:
+                print(
+                    f"  +{len(new_labeled)} → {len(labeled_indices)}/{n_pool} "
+                    f"({len(labeled_indices) / n_pool:.1%}) labeled"
+                )
+
+            # Reveal GT labels for all accumulated labeled examples; weak labels remain for the rest.
+            def _reveal(ex, idx, _li=labeled_indices):
+                if idx in _li:
+                    gt = int(ex["gt_label"])
+                    return {"soft_label": [1.0 - float(gt), float(gt)]}
+                return {}
+
+            mixed_tok = train1_tok.map(_reveal, with_indices=True, load_from_cache_file=False)
+
+            if n_al_rounds > 1:
+                print(f"  Training round {round_idx + 1}/{n_al_rounds}...")
+            else:
+                print(f"Training model model, size {model_size}")
+            test_results, weak_ds = train_and_save_model(
+                model_config,
+                mixed_tok,
+                test_ds,
+                inference_ds=None,
+                batch_size=batch_size,
+                save_path=round_save,
+                loss_fn=loss_fn,
+                lr=lr,
+                epochs=epochs,
+                force_retrain=force_retrain,
+                eval_batch_size=eval_batch_size,
+                minibatch_size_per_device=minibatch_size_per_device,
+                train_with_dropout=train_with_dropout,
+                linear_probe=linear_probe,
+                lr_schedule=lr_schedule,
+                optimizer_name=optim,
+                eval_every=eval_every,
+                resume_from_checkpoint=current_checkpoint,
+            )
+            current_checkpoint = round_save
+            if n_al_rounds > 1 and test_results is not None:
+                round_acc = np.mean([x["acc"] for x in test_results])
+                print(f"  Round {round_idx + 1}/{n_al_rounds} accuracy: {round_acc:.4f}")
+
+    else:
+        # No AL: tokenize and train directly.
+        train1_ds = tokenize_dataset(train1_ds, tokenizer, max_ctx)
+        print(f"Training model model, size {model_size}")
+        test_results, weak_ds = train_and_save_model(
+            model_config,
+            train1_ds,
+            test_ds,
+            inference_ds=train2_ds,
+            batch_size=batch_size,
+            save_path=save_path,
+            loss_fn=loss_fn,
+            lr=lr,
+            epochs=epochs,
+            force_retrain=force_retrain,
+            eval_batch_size=eval_batch_size,
+            minibatch_size_per_device=minibatch_size_per_device,
+            train_with_dropout=train_with_dropout,
+            linear_probe=linear_probe,
+            lr_schedule=lr_schedule,
+            optimizer_name=optim,
+            eval_every=eval_every,
+            resume_from_checkpoint=resume_from_checkpoint,
+        )
 
     if weak_ds is not None:
         weak_ds.save_to_disk(save_path + "/" + "weak_labels")

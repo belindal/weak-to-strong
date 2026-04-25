@@ -123,20 +123,33 @@ loss_dict = {
 
 VALID_LOSSES: List[str] = list(loss_dict.keys())
 
-VALID_AL_STRATEGIES = ["least_confidence", "entropy", "margin", "random"]
+VALID_AL_STRATEGIES = ["least_confidence", "entropy", "margin", "random", "disagreement"]
 
 
-def _compute_uncertainty(soft_labels: np.ndarray, strategy: str, seed: int = 0) -> np.ndarray:
+def _score_examples(
+    strong_soft_labels: np.ndarray,
+    strategy: str,
+    weak_soft_labels: Optional[np.ndarray] = None,
+    seed: int = 0,
+) -> np.ndarray:
+    """Return per-example selection scores (higher = more worth labeling).
+
+    strong_soft_labels: shape [n, 2], current model's softmax predictions.
+    weak_soft_labels:   shape [n, 2], required when strategy='disagreement'.
+    """
     if strategy == "least_confidence":
-        return 1.0 - np.max(soft_labels, axis=1)
+        return 1.0 - np.max(strong_soft_labels, axis=1)
     if strategy == "entropy":
         eps = 1e-10
-        return -np.sum(soft_labels * np.log(soft_labels + eps), axis=1)
+        return -np.sum(strong_soft_labels * np.log(strong_soft_labels + eps), axis=1)
     if strategy == "margin":
-        sorted_p = np.sort(soft_labels, axis=1)[:, ::-1]
+        sorted_p = np.sort(strong_soft_labels, axis=1)[:, ::-1]
         return 1.0 - (sorted_p[:, 0] - sorted_p[:, 1])
     if strategy == "random":
-        return np.random.default_rng(seed).random(len(soft_labels))
+        return np.random.default_rng(seed).random(len(strong_soft_labels))
+    if strategy == "disagreement":
+        assert weak_soft_labels is not None, "disagreement strategy requires weak_soft_labels"
+        return np.abs(weak_soft_labels[:, 1] - strong_soft_labels[:, 1])
     raise ValueError(f"Unknown al_strategy {strategy!r}; choose from {VALID_AL_STRATEGIES}")
 
 
@@ -245,6 +258,9 @@ def main(
         assert mix_ratio is not None, "al_strategy requires --mix_ratio to set the GT-label budget"
         assert weak_labels_path is not None or weak_model_size is not None, \
             "al_strategy requires weak labels (--weak_labels_path or --weak_model_size)"
+        if al_strategy == "disagreement":
+            assert weak_labels_path is not None or weak_model_size is not None, \
+                "al_strategy='disagreement' requires weak labels to compare against"
     if n_al_rounds > 1:
         assert al_strategy is not None, "n_al_rounds > 1 requires --al_strategy"
 
@@ -414,10 +430,11 @@ def main(
 
             unlabeled_mask = [i for i in range(n_pool) if i not in labeled_indices]
             unlabeled_tok = train1_tok.select(unlabeled_mask)
+            weak_soft = np.array(unlabeled_tok["soft_label"]) if al_strategy == "disagreement" else None
             scored = _score_pool(model_config, current_checkpoint, unlabeled_tok, eval_batch_size)
-
-            round_scores = _compute_uncertainty(
-                np.array(scored["soft_label"]), al_strategy, seed=seed + round_idx
+            round_scores = _score_examples(
+                np.array(scored["soft_label"]), al_strategy,
+                weak_soft_labels=weak_soft, seed=seed + round_idx,
             )
             new_labeled = {unlabeled_mask[i] for i in np.argsort(-round_scores)[:per_round_k]}
             labeled_indices |= new_labeled
@@ -438,6 +455,12 @@ def main(
 
             if n_al_rounds > 1:
                 print(f"  Training round {round_idx + 1}/{n_al_rounds}...")
+                logger.configure(
+                    name="{sweep_subfolder}_{config_name}_{datetime_now}",
+                    save_path=round_save,
+                    sweep_subfolder=sweep_subfolder,
+                    config_name=config_name,
+                )
             else:
                 print(f"Training model model, size {model_size}")
             test_results, weak_ds = train_and_save_model(

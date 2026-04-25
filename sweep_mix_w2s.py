@@ -104,6 +104,7 @@ def _get_save_path(
     mix_ratio: float | None = None,
     mix_selection: str | None = None,
     al_strategy: str | None = None,
+    n_al_rounds: int = 1,
 ) -> str:
     """Replicate train_simple's config → folder-name logic to find the results JSON."""
     mc = MODELS_DICT[model_size]
@@ -128,6 +129,8 @@ def _get_save_path(
         config["mix_ratio"] = mix_ratio
         if al_strategy is not None:
             config["al_strategy"] = al_strategy
+            if n_al_rounds > 1:
+                config["n_al_rounds"] = n_al_rounds
         elif mix_selection is not None:
             config["mix_selection"] = mix_selection
     if weak_model_size is not None:
@@ -186,6 +189,8 @@ def sweep(
     # AL strategies to sweep; empty string skips AL entirely.
     # e.g. "least_confidence" or "least_confidence,random"
     al_strategies: Union[str, Sequence[str]] = "",
+    # Number of AL rounds to sweep; can be a single value or comma-separated list.
+    n_al_rounds: Union[int, Sequence[int]] = 1,
     # Set False to skip weak model training (e.g. labels already generated).
     train_weak: bool = True,
     # Set False to skip Phase 2 (mix + baseline runs, e.g. already completed).
@@ -197,6 +202,7 @@ def sweep(
     seeds = [seeds] if isinstance(seeds, int) else list(seeds)
     selections = _to_list(mix_selections)
     al_strats = _to_list(al_strategies)
+    n_al_rounds_list = [n_al_rounds] if isinstance(n_al_rounds, int) else [int(x) for x in n_al_rounds]
 
     for ds in ds_names:
         assert ds in VALID_DATASETS, f"Unknown dataset {ds!r}; valid: {list(VALID_DATASETS)}"
@@ -210,7 +216,7 @@ def sweep(
         if _size_rank(weak_size) >= _size_rank(strong_size)
     ]
     n_mix = len(configs) * len(selections)
-    n_al = len(configs) * len(al_strats)
+    n_al = len(configs) * len(al_strats) * len(n_al_rounds_list)
     print(
         f"Sweep: {len(configs)} configs × {len(selections)} mix selections = {n_mix} mix runs"
         + (f", × {len(al_strats)} AL strategies = {n_al} AL runs" if al_strats else "") + "\n"
@@ -310,24 +316,28 @@ def sweep(
     al_jobs = []
     for ds, weak_size, strong_size, seed in configs:
         for al_strat in al_strats:
-            al_jobs.append({
-                "model_size": strong_size,
-                "weak_size": weak_size,
-                "ds": ds,
-                "seed": seed,
-                "selection": f"strong_active/{al_strat}",
-                "al_strategy": al_strat,
-                "label": f"AL {ds} {weak_size}→{strong_size} {al_strat} s{seed}",
-                "cmd": _build_cmd(
-                    model_size=strong_size,
-                    weak_model_size=weak_size,
-                    ds_name=ds,
-                    seed=seed,
-                    mix_ratio=mix_ratio,
-                    al_strategy=al_strat,
-                    **common,
-                ),
-            })
+            for n_rounds in n_al_rounds_list:
+                rounds_tag = f" r{n_rounds}" if n_rounds > 1 else ""
+                al_jobs.append({
+                    "model_size": strong_size,
+                    "weak_size": weak_size,
+                    "ds": ds,
+                    "seed": seed,
+                    "selection": f"strong_active/{al_strat}",
+                    "al_strategy": al_strat,
+                    "n_al_rounds": n_rounds,
+                    "label": f"AL {ds} {weak_size}→{strong_size} {al_strat}{rounds_tag} s{seed}",
+                    "cmd": _build_cmd(
+                        model_size=strong_size,
+                        weak_model_size=weak_size,
+                        ds_name=ds,
+                        seed=seed,
+                        mix_ratio=mix_ratio,
+                        al_strategy=al_strat,
+                        n_al_rounds=n_rounds if n_rounds > 1 else None,
+                        **common,
+                    ),
+                })
 
     if al_jobs:
         print(f"\nPhase 3: {len(al_jobs)} AL runs")
@@ -355,6 +365,7 @@ def sweep(
             mix_ratio=mix_ratio,
             mix_selection=j["selection"] if j["al_strategy"] is None else None,
             al_strategy=j["al_strategy"],
+            n_al_rounds=j.get("n_al_rounds", 1),
             **save_path_kwargs,
         )
         weak_save_path = _get_save_path(
@@ -370,6 +381,7 @@ def sweep(
             "seed": j["seed"],
             "mix_ratio": mix_ratio,
             "selection": j["selection"],
+            "n_al_rounds": j.get("n_al_rounds", 1),
             "weak_acc": _read_accuracy(weak_save_path),
             "transfer_acc": _read_accuracy(save_path),
         })

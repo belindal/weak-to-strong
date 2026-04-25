@@ -185,6 +185,7 @@ def train_and_save_model(
     lr_schedule: str = "constant",
     optimizer_name: str = "adam",
     eval_every: Optional[int] = None,
+    resume_from_checkpoint: Optional[str] = None,
 ):
     if eval_batch_size is None:
         eval_batch_size = batch_size
@@ -212,6 +213,19 @@ def train_and_save_model(
             return True
         return False
 
+    def load_checkpoint(model, path):
+        checkpoint_bin = os.path.join(path, "pytorch_model.bin")
+        if not os.path.exists(checkpoint_bin):
+            load_sharded_checkpoint(model, checkpoint_bin)
+        else:
+            state_dict = torch.load(checkpoint_bin)
+            state_dict = {
+                k.replace("transformer.module", "transformer"): v
+                for (k, v) in state_dict.items()
+            }
+            model.load_state_dict(state_dict, strict=False)
+        print("Loaded checkpoint from", path)
+
     already_trained = False
     # Load the model
     if model_config.model_parallel:
@@ -223,14 +237,20 @@ def train_and_save_model(
             linear_probe=linear_probe,
             **custom_kwargs,
         )
-        already_trained = maybe_load_model(model)
+        if resume_from_checkpoint:
+            load_checkpoint(model, resume_from_checkpoint)
+        else:
+            already_trained = maybe_load_model(model)
         # slight misnomer, more like minibatch_size_per_dp_replica
         minibatch_size = minibatch_size_per_device
     else:
         model = TransformerWithHead.from_pretrained(
             model_config.name, num_labels=2, linear_probe=linear_probe, **custom_kwargs
         ).to("cuda")
-        already_trained = maybe_load_model(model)
+        if resume_from_checkpoint:
+            load_checkpoint(model, resume_from_checkpoint)
+        else:
+            already_trained = maybe_load_model(model)
         # data parallel:  currently not supported with model parallel
 
         minibatch_size = min(minibatch_size_per_device * torch.cuda.device_count(), batch_size)

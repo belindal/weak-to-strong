@@ -10,10 +10,12 @@ import torch
 from datasets import load_from_disk
 
 import weak_to_strong.logger as logger
-from weak_to_strong.common import get_tokenizer
+from weak_to_strong.common import clear_mem, get_tokenizer
 from weak_to_strong.datasets import (VALID_DATASETS, load_dataset,
                                      tokenize_dataset, mix_labels)
+from weak_to_strong.eval import eval_model_acc
 from weak_to_strong.loss import logconf_loss_fn, product_loss_fn, xent_loss
+from weak_to_strong.model import TransformerWithHead
 from weak_to_strong.train import ModelConfig, train_and_save_model
 
 # NOTE learning rates are not particularly tuned, work somewhat reasonably at train batch size 32
@@ -121,6 +123,22 @@ loss_dict = {
 
 VALID_LOSSES: List[str] = list(loss_dict.keys())
 
+VALID_AL_STRATEGIES = ["least_confidence", "entropy", "margin", "random"]
+
+
+def _compute_uncertainty(soft_labels: np.ndarray, strategy: str, seed: int = 0) -> np.ndarray:
+    if strategy == "least_confidence":
+        return 1.0 - np.max(soft_labels, axis=1)
+    if strategy == "entropy":
+        eps = 1e-10
+        return -np.sum(soft_labels * np.log(soft_labels + eps), axis=1)
+    if strategy == "margin":
+        sorted_p = np.sort(soft_labels, axis=1)[:, ::-1]
+        return 1.0 - (sorted_p[:, 0] - sorted_p[:, 1])
+    if strategy == "random":
+        return np.random.default_rng(seed).random(len(soft_labels))
+    raise ValueError(f"Unknown al_strategy {strategy!r}; choose from {VALID_AL_STRATEGIES}")
+
 
 def get_config_foldername(config: dict) -> str:
     def shorten_key(key: str) -> str:
@@ -176,12 +194,23 @@ def main(
     # How to select which examples get strong labels: "random" or "active".
     # "active": replace the mix_ratio fraction with lowest weak-model confidence.
     mix_selection: str = "random",
+    resume_from_checkpoint: Optional[str] = None,
+    # When set, scores the training pool with the strong model checkpoint and
+    # replaces the top mix_ratio fraction (by uncertainty) with GT labels.
+    # Requires both --resume_from_checkpoint and --mix_ratio to be set.
+    # Choices: least_confidence | entropy | margin | random
+    al_strategy: Optional[str] = None,
 ):
     # this is per device!
     if minibatch_size_per_device is None:
         minibatch_size_per_device = 1
     if mix_ratio is not None:
         assert 0.0 <= mix_ratio <= 1.0, f"mix_ratio must be in [0, 1], got {mix_ratio}"
+    if al_strategy is not None:
+        assert al_strategy in VALID_AL_STRATEGIES, f"al_strategy must be one of {VALID_AL_STRATEGIES}"
+        assert mix_ratio is not None, "al_strategy requires --mix_ratio to set the GT-label budget"
+        assert weak_labels_path is not None or weak_model_size is not None, \
+            "al_strategy requires weak labels (--weak_labels_path or --weak_model_size)"
 
     assert ds_name in VALID_DATASETS, f"Unknown dataset {ds_name} not in {VALID_DATASETS}"
     assert (
@@ -224,14 +253,20 @@ def main(
     }
     if mix_ratio is not None:
         config["mix_ratio"] = mix_ratio
-        config["mix_selection"] = mix_selection
+        if al_strategy is not None:
+            config["al_strategy"] = al_strategy
+        else:
+            config["mix_selection"] = mix_selection
 
     if weak_model_size is not None:
         weak_model_config = config.copy()
         weak_model_config["model_size"] = weak_model_size
         weak_model_config["loss"] = "xent"
         del weak_model_config["mix_ratio"]
-        del weak_model_config["mix_selection"]
+        if "mix_selection" in weak_model_config:
+            del weak_model_config["mix_selection"]
+        if "al_strategy" in weak_model_config:
+            del weak_model_config["al_strategy"]
         if use_default_lr:
             weak_model_config["lr"] = MODELS_DICT[weak_model_size].default_lr
 
@@ -259,9 +294,16 @@ def main(
         if not weak_labels_path.endswith("weak_labels"):
             weak_labels_path = weak_labels_path + "/weak_labels"
         if mix_ratio is not None:  # and mix_ratio != 1.0 and mix_ratio != 0.0:
-            print(
-                f"Training mix model, size {model_size} on {mix_ratio:.0%} strong ({mix_selection}) + {1-mix_ratio:.0%} weak labels from weak model {weak_model_size}"
-            )
+            if al_strategy is not None:
+                print(
+                    f"AL mix model, size {model_size}: scoring with checkpoint, "
+                    f"replacing top {mix_ratio:.0%} uncertain ({al_strategy}) with GT labels, "
+                    f"weak labels for remaining {1-mix_ratio:.0%}"
+                )
+            else:
+                print(
+                    f"Training mix model, size {model_size} on {mix_ratio:.0%} strong ({mix_selection}) + {1-mix_ratio:.0%} weak labels from weak model {weak_model_size}"
+                )
         if sync_command is not None:
             sync_command_list = sync_command.split(" ")
             sync_command_list.extend(
@@ -272,13 +314,20 @@ def main(
             if result.returncode != 0:
                 raise RuntimeError(f"Sync command failed with return code {result.returncode}")
         train1_ds = load_from_disk(weak_labels_path)
-        if mix_ratio is not None:
+        if al_strategy is None and mix_ratio is not None:
             train1_ds = mix_labels(train1_ds, strong_frac=mix_ratio, seed=seed, selection=mix_selection)
         train2_ds = None
 
         weak_model_config = json.load(open(weak_labels_path.replace("weak_labels", "config.json")))
         config["weak_model_size"] = weak_model_config["model_size"]
         config_name = get_config_foldername(config)
+        if al_strategy is not None and resume_from_checkpoint is None:
+            w2s_base_config = {k: v for k, v in config.items()
+                               if k not in ("mix_ratio", "al_strategy", "mix_selection")}
+            resume_from_checkpoint = os.path.join(
+                results_folder, sweep_subfolder, get_config_foldername(w2s_base_config)
+            )
+            print(f"Inferred resume_from_checkpoint: {resume_from_checkpoint}")
         config["weak_model"] = weak_model_config
 
     save_path = os.path.join(results_folder, sweep_subfolder, config_name)
@@ -290,6 +339,37 @@ def main(
     )
     # Tokenize datasets
     tokenizer = get_tokenizer(model_config.name)
+
+    al_scores = None
+    if al_strategy is not None:
+        # Either passed explicitly or inferred from the W2S base config path above.
+        assert resume_from_checkpoint is not None, "Could not infer resume_from_checkpoint; pass it explicitly"
+        assert mix_ratio is not None
+        # Score the pool with the strong model checkpoint to get per-example uncertainty.
+        tokenized_for_scoring = tokenize_dataset(train1_ds, tokenizer, max_ctx)
+        custom_kwargs = model_config.custom_kwargs or {}
+        if model_config.model_parallel:
+            score_model = TransformerWithHead.from_pretrained(
+                model_config.name, num_labels=2, device_map="auto", **custom_kwargs
+            )
+        else:
+            score_model = TransformerWithHead.from_pretrained(
+                model_config.name, num_labels=2, **custom_kwargs
+            ).to("cuda")
+        ckpt_bin = os.path.join(resume_from_checkpoint, "pytorch_model.bin")
+        if os.path.exists(ckpt_bin):
+            state_dict = torch.load(ckpt_bin, map_location="cpu")
+            state_dict = {
+                k.replace("transformer.module", "transformer"): v
+                for k, v in state_dict.items()
+            }
+            score_model.load_state_dict(state_dict, strict=False)
+        scored = eval_model_acc(score_model, tokenized_for_scoring, eval_batch_size)
+        del score_model, tokenized_for_scoring
+        clear_mem()
+        al_scores = _compute_uncertainty(np.array(scored["soft_label"]), al_strategy, seed=seed)
+        train1_ds = mix_labels(train1_ds, strong_frac=mix_ratio, seed=seed, selection="strong_active", scores=al_scores)
+
     train1_ds = tokenize_dataset(train1_ds, tokenizer, max_ctx)
     test_ds = tokenize_dataset(test_ds, tokenizer, max_ctx)
     if train2_ds:
@@ -315,6 +395,7 @@ def main(
         lr_schedule=lr_schedule,
         optimizer_name=optim,
         eval_every=eval_every,
+        resume_from_checkpoint=resume_from_checkpoint,
     )
 
     if weak_ds is not None:

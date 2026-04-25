@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from random import Random
 from typing import Any, Callable, Optional
 
+import numpy as np
 from datasets import Dataset as HfDataset
 from datasets import load_dataset as hf_load_dataset
 import random
@@ -13,34 +14,40 @@ def mix_labels(
     strong_frac: float,
     seed: int = 0,
     selection: str = "random",
+    scores: Optional[np.ndarray] = None,
 ) -> HfDataset:
     """Replace soft_label with one-hot ground truth for strong_frac fraction of examples.
 
     Args:
         weak_ds: Dataset with soft_label (weak model predictions) and gt_label (ground truth int).
         strong_frac: Fraction of examples in [0, 1] to replace with strong (ground truth) labels.
-        seed: Random seed (used for "random" selection; ignored for "active").
+        seed: Random seed for "random" selection.
         selection: How to choose which examples get strong labels.
-            "random" — uniformly sample strong_frac of examples.
-            "active" — find the confidence threshold that covers strong_frac of samples
-                       (max(soft_label) per example), then replace all examples whose
-                       weak model confidence falls below that threshold.
+            "random"       — uniformly sample strong_frac of examples.
+            "weak_active"  — least-confident weak model examples (lowest max soft_label) get GT labels.
+            "strong_active"— most uncertain strong model examples; requires scores to be provided.
+        scores: Per-example uncertainty scores (higher = more uncertain). Required for "strong_active".
     """
-    assert selection in ("random", "active"), f"Unknown selection {selection!r}, expected 'random' or 'active'"
     n = len(weak_ds)
     k = round(strong_frac * n)
 
     if selection == "random":
-        strong_indices = random.sample(range(n), k)
+        strong_indices = set(random.sample(range(n), k))
         print(f"Random selection: replacing {k}/{n} examples with strong labels")
-    else:  # active
+    elif selection == "weak_active":
         confidences = [max(ex["soft_label"]) for ex in weak_ds]
         # Sort indices by confidence ascending; take the bottom strong_frac fraction.
         sorted_by_conf = sorted(range(n), key=lambda i: confidences[i])
         strong_indices = set(sorted_by_conf[:k])
         if k > 0:
             threshold = confidences[sorted_by_conf[k - 1]]
-            print(f"Active selection: confidence threshold = {threshold:.4f}, replacing {k}/{n} examples")
+            print(f"Weak-active selection: confidence threshold = {threshold:.4f}, replacing {k}/{n} examples")
+    elif selection == "strong_active":
+        assert scores is not None, "selection='strong_active' requires scores to be provided"
+        strong_indices = set(int(i) for i in np.argsort(-scores)[:k])
+        print(f"Strong-active selection: replacing {k}/{n} most uncertain examples with strong labels")
+    else:
+        raise ValueError(f"Unknown selection {selection!r}, expected 'random', 'weak_active', or 'strong_active'")
 
     def replace_label(ex, idx):
         if idx in strong_indices:

@@ -18,7 +18,7 @@ Usage
 # Sweep over weak and strong model sizes
   python sweep_mix_w2s.py \
     --weak_model_sizes gpt2,gpt2-medium \
-    --model_sizes gpt2-large,gpt2-xl \
+    --strong_model_sizes gpt2-large,gpt2-xl \
     --ds_names boolq,sciq \
     --seeds 0,1,2
 
@@ -160,7 +160,7 @@ def _run_phase(jobs: list, semaphores: Dict[str, Semaphore], default_sem: Semaph
 def sweep(
     ds_names: Union[str, Sequence[str]] = "boolq",
     weak_model_sizes: Union[str, Sequence[str]] = "gpt2",
-    model_sizes: Union[str, Sequence[str]] = "gpt2-xl",
+    strong_model_sizes: Union[str, Sequence[str]] = "gpt2-xl",
     loss: str = "xent",
     seeds: Union[int, Sequence[int]] = 0,
     mix_ratio: float = 0.25,
@@ -175,22 +175,22 @@ def sweep(
     lr_schedule: str = "cosine_anneal",
     eval_every: int = 1000000,
     force_retrain: bool = False,
-    selections: Union[str, Sequence[str]] = "random,active",
+    mix_selections: Union[str, Sequence[str]] = "random,weak_active",
     # Set False to skip weak model training (e.g. labels already generated).
     train_weak: bool = True,
 ):
     ds_names = _to_list(ds_names)
     weak_model_sizes = _to_list(weak_model_sizes)
-    model_sizes = _to_list(model_sizes)
+    strong_model_sizes = _to_list(strong_model_sizes)
     seeds = [seeds] if isinstance(seeds, int) else list(seeds)
-    selections = _to_list(selections)
+    selections = _to_list(mix_selections)
 
     for ds in ds_names:
         assert ds in VALID_DATASETS, f"Unknown dataset {ds!r}; valid: {list(VALID_DATASETS)}"
-    for m in weak_model_sizes + model_sizes:
+    for m in weak_model_sizes + strong_model_sizes:
         assert m in MODELS_DICT, f"Unknown model {m!r}; valid: {list(MODELS_DICT)}"
 
-    configs = list(itertools.product(ds_names, weak_model_sizes, model_sizes, seeds))
+    configs = list(itertools.product(ds_names, weak_model_sizes, strong_model_sizes, seeds))
     n_transfer = len(configs) * len(selections)
     print(
         f"Sweep: {len(configs)} configs × {len(selections)} selections = {n_transfer} transfer runs\n"

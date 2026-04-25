@@ -12,7 +12,7 @@ so GPU slots are never idle while work remains.
 
 Usage
 -----
-# Defaults: boolq, gpt2->gpt2-xl, random+active, seed 0
+# Defaults: boolq, gpt2->gpt2-xl, random+weak_active, seed 0
   python sweep_mix_w2s.py
 
 # Sweep over weak and strong model sizes
@@ -25,8 +25,11 @@ Usage
 # Skip weak model training (labels already generated)
   python sweep_mix_w2s.py --train_weak False
 
-# Different budget, only random selection
-  python sweep_mix_w2s.py --mix_ratio 0.10 --selections random
+# Include strong-model active learning (least_confidence) alongside standard mixing
+  python sweep_mix_w2s.py --al_strategies least_confidence
+
+# AL only, no standard mixing
+  python sweep_mix_w2s.py --mix_selections "" --al_strategies least_confidence --mix_ratio 0.10
 """
 
 import csv
@@ -100,6 +103,7 @@ def _get_save_path(
     weak_model_size: str | None = None,
     mix_ratio: float | None = None,
     mix_selection: str | None = None,
+    al_strategy: str | None = None,
 ) -> str:
     """Replicate train_simple's config → folder-name logic to find the results JSON."""
     mc = MODELS_DICT[model_size]
@@ -122,7 +126,10 @@ def _get_save_path(
     }
     if mix_ratio is not None:
         config["mix_ratio"] = mix_ratio
-        config["mix_selection"] = mix_selection
+        if al_strategy is not None:
+            config["al_strategy"] = al_strategy
+        elif mix_selection is not None:
+            config["mix_selection"] = mix_selection
     if weak_model_size is not None:
         config["weak_model_size"] = weak_model_size
     return os.path.join(results_folder, sweep_subfolder, get_config_foldername(config))
@@ -176,26 +183,40 @@ def sweep(
     eval_every: int = 1000000,
     force_retrain: bool = False,
     mix_selections: Union[str, Sequence[str]] = "random,weak_active",
+    # AL strategies to sweep; empty string skips AL entirely.
+    # e.g. "least_confidence" or "least_confidence,random"
+    al_strategies: Union[str, Sequence[str]] = "",
     # Set False to skip weak model training (e.g. labels already generated).
     train_weak: bool = True,
+    # Set False to skip Phase 2 (mix + baseline runs, e.g. already completed).
+    train_transfer: bool = True,
 ):
     ds_names = _to_list(ds_names)
     weak_model_sizes = _to_list(weak_model_sizes)
     strong_model_sizes = _to_list(strong_model_sizes)
     seeds = [seeds] if isinstance(seeds, int) else list(seeds)
     selections = _to_list(mix_selections)
+    al_strats = _to_list(al_strategies)
 
     for ds in ds_names:
         assert ds in VALID_DATASETS, f"Unknown dataset {ds!r}; valid: {list(VALID_DATASETS)}"
     for m in weak_model_sizes + strong_model_sizes:
         assert m in MODELS_DICT, f"Unknown model {m!r}; valid: {list(MODELS_DICT)}"
 
-    configs = list(itertools.product(ds_names, weak_model_sizes, strong_model_sizes, seeds))
-    n_transfer = len(configs) * len(selections)
+    configs = [
+        (ds, weak_size, strong_size, seed)
+        for ds, weak_size, strong_size, seed
+        in itertools.product(ds_names, weak_model_sizes, strong_model_sizes, seeds)
+        if _size_rank(weak_size) >= _size_rank(strong_size)
+    ]
+    n_mix = len(configs) * len(selections)
+    n_al = len(configs) * len(al_strats)
     print(
-        f"Sweep: {len(configs)} configs × {len(selections)} selections = {n_transfer} transfer runs\n"
+        f"Sweep: {len(configs)} configs × {len(selections)} mix selections = {n_mix} mix runs"
+        + (f", × {len(al_strats)} AL strategies = {n_al} AL runs" if al_strats else "") + "\n"
         f"  mix_ratio={mix_ratio:.0%}, selections={selections}, seeds={seeds}\n"
-        f"  concurrency: {SIZE_CONCURRENCY}"
+        + (f"  al_strategies={al_strats}\n" if al_strats else "")
+        + f"  concurrency: {SIZE_CONCURRENCY}"
     )
 
     os.makedirs(results_folder, exist_ok=True)
@@ -234,7 +255,7 @@ def sweep(
         print(f"\nPhase 1: {len(weak_jobs)} weak-model runs")
         _run_phase(weak_jobs, semaphores, default_sem)
 
-    # ── Phase 2: transfer with mixing ─────────────────────────────────────────
+    # ── Phase 2: standard mix runs + W2S baseline (needed as AL checkpoint) ───
     transfer_jobs = []
     for ds, weak_size, strong_size, seed in configs:
         for selection in selections:
@@ -244,6 +265,7 @@ def sweep(
                 "ds": ds,
                 "seed": seed,
                 "selection": selection,
+                "al_strategy": None,
                 "label": f"transfer {ds} {weak_size}→{strong_size} {selection} s{seed}",
                 "cmd": _build_cmd(
                     model_size=strong_size,
@@ -256,8 +278,60 @@ def sweep(
                 ),
             })
 
-    print(f"\nPhase 2: {len(transfer_jobs)} transfer runs")
-    _run_phase(transfer_jobs, semaphores, default_sem)
+    # W2S baseline (no mixing) is the checkpoint AL scoring loads from.
+    baseline_jobs = []
+    if al_strats:
+        seen_baseline: set = set()
+        for ds, weak_size, strong_size, seed in configs:
+            key = (ds, weak_size, strong_size, seed)
+            if key in seen_baseline:
+                continue
+            seen_baseline.add(key)
+            baseline_jobs.append({
+                "model_size": strong_size,
+                "label": f"baseline {ds} {weak_size}→{strong_size} s{seed}",
+                "cmd": _build_cmd(
+                    model_size=strong_size,
+                    weak_model_size=weak_size,
+                    ds_name=ds,
+                    seed=seed,
+                    **common,
+                ),
+            })
+
+    phase2_jobs = transfer_jobs + baseline_jobs
+    print(f"\nPhase 2: {len(phase2_jobs)} runs ({len(transfer_jobs)} mix, {len(baseline_jobs)} baseline)")
+    if train_transfer:
+        _run_phase(phase2_jobs, semaphores, default_sem)
+    else:
+        print("  Skipping (train_transfer=False)")
+
+    # ── Phase 3: AL (strong_active) runs ──────────────────────────────────────
+    al_jobs = []
+    for ds, weak_size, strong_size, seed in configs:
+        for al_strat in al_strats:
+            al_jobs.append({
+                "model_size": strong_size,
+                "weak_size": weak_size,
+                "ds": ds,
+                "seed": seed,
+                "selection": f"strong_active/{al_strat}",
+                "al_strategy": al_strat,
+                "label": f"AL {ds} {weak_size}→{strong_size} {al_strat} s{seed}",
+                "cmd": _build_cmd(
+                    model_size=strong_size,
+                    weak_model_size=weak_size,
+                    ds_name=ds,
+                    seed=seed,
+                    mix_ratio=mix_ratio,
+                    al_strategy=al_strat,
+                    **common,
+                ),
+            })
+
+    if al_jobs:
+        print(f"\nPhase 3: {len(al_jobs)} AL runs")
+        _run_phase(al_jobs, semaphores, default_sem)
 
     # ── Collect results ────────────────────────────────────────────────────────
     save_path_kwargs = dict(
@@ -272,14 +346,15 @@ def sweep(
         eval_every=eval_every,
     )
     rows = []
-    for j in transfer_jobs:
+    for j in transfer_jobs + al_jobs:
         save_path = _get_save_path(
             model_size=j["model_size"],
             ds_name=j["ds"],
             seed=j["seed"],
             weak_model_size=j["weak_size"],
             mix_ratio=mix_ratio,
-            mix_selection=j["selection"],
+            mix_selection=j["selection"] if j["al_strategy"] is None else None,
+            al_strategy=j["al_strategy"],
             **save_path_kwargs,
         )
         weak_save_path = _get_save_path(

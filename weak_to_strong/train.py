@@ -215,15 +215,15 @@ def train_and_save_model(
 
     def load_checkpoint(model, path):
         checkpoint_bin = os.path.join(path, "pytorch_model.bin")
-        if not os.path.exists(checkpoint_bin):
-            load_sharded_checkpoint(model, checkpoint_bin)
-        else:
+        if os.path.exists(checkpoint_bin):
             state_dict = torch.load(checkpoint_bin)
             state_dict = {
                 k.replace("transformer.module", "transformer"): v
                 for (k, v) in state_dict.items()
             }
             model.load_state_dict(state_dict, strict=False)
+        else:
+            load_sharded_checkpoint(model, path)
         print("Loaded checkpoint from", path)
 
     already_trained = False

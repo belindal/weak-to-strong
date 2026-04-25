@@ -2,3 +2,5 @@ dump
 *.pyc
 *.swp
 *.swo
+*.ipynb
+train_weak_to_strong.py

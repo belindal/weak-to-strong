@@ -7,6 +7,8 @@ from typing import Dict, List, Optional
 import fire
 import numpy as np
 import torch
+from sklearn.linear_model import LogisticRegression
+from sklearn.isotonic import IsotonicRegression
 from datasets import load_from_disk
 
 import weak_to_strong.logger as logger
@@ -124,6 +126,113 @@ loss_dict = {
 VALID_LOSSES: List[str] = list(loss_dict.keys())
 
 VALID_AL_STRATEGIES = ["least_confidence", "entropy", "margin", "random", "disagreement"]
+
+VALID_CALIBRATION_TYPES = ["platt", "isotonic"]
+
+
+def _compute_ece(soft_labels: np.ndarray, gt_labels: np.ndarray, n_bins: int = 10) -> float:
+    """Expected Calibration Error: weighted mean |accuracy - confidence| across equal-width bins."""
+    confidences = np.max(soft_labels, axis=1)
+    predictions = np.argmax(soft_labels, axis=1)
+    correct = (predictions == gt_labels).astype(float)
+    ece = 0.0
+    for lo, hi in zip(np.linspace(0, 1, n_bins + 1)[:-1], np.linspace(0, 1, n_bins + 1)[1:]):
+        mask = (confidences >= lo) & (confidences < hi)
+        if mask.sum() == 0:
+            continue
+        ece += mask.mean() * abs(correct[mask].mean() - confidences[mask].mean())
+    return ece
+
+
+def _apply_calibration(ds, calibration_type: str, calibration_ratio: float, seed: int):
+    """Split ds into calibration/train subsets, fit calibration, apply to train subset, report ECE."""
+    assert "gt_label" in ds.column_names, \
+        "calibration requires 'gt_label' column; pass weak labels via --weak_labels_path or --weak_model_size"
+    assert calibration_type in VALID_CALIBRATION_TYPES, \
+        f"calibration_type must be one of {VALID_CALIBRATION_TYPES}"
+
+    n = len(ds)
+    n_cal = max(1, round(calibration_ratio * n))
+
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n).tolist()
+    cal_ds = ds.select(idx[:n_cal])
+    rest_ds = ds.select(idx[n_cal:])
+
+    cal_soft = np.array(cal_ds["soft_label"])
+    cal_gt = np.array(cal_ds["gt_label"])
+    rest_soft = np.array(rest_ds["soft_label"])
+    rest_gt = np.array(rest_ds["gt_label"])
+
+    ece_cal_before = _compute_ece(cal_soft, cal_gt)
+    ece_train_before = _compute_ece(rest_soft, rest_gt)
+    print(
+        f"ECE before {calibration_type}  — "
+        f"calibration set ({n_cal}): {ece_cal_before:.4f}  "
+        f"training set ({n - n_cal}): {ece_train_before:.4f}"
+    )
+
+    if calibration_type == "platt":
+        p_pos = np.clip(cal_soft[:, 1], 1e-7, 1 - 1e-7)
+        cal_logits = np.log(p_pos / (1 - p_pos)).reshape(-1, 1)
+        clf = LogisticRegression(C=1.0, solver="lbfgs")
+        clf.fit(cal_logits, cal_gt)
+        a = float(clf.coef_[0, 0])
+        b = float(clf.intercept_[0])
+        print(f"Platt scaling fit: a={a:.4f}, b={b:.4f}")
+
+        def _calibrate_soft(raw: np.ndarray) -> np.ndarray:
+            p = np.clip(raw[:, 1], 1e-7, 1 - 1e-7)
+            logits_2d = np.log(p / (1 - p)).reshape(-1, 1)
+            # clf.predict_proba columns follow clf.classes_ order ([0, 1])
+            return clf.predict_proba(logits_2d)
+
+        ece_cal_after = _compute_ece(_calibrate_soft(cal_soft), cal_gt)
+        ece_train_after = _compute_ece(_calibrate_soft(rest_soft), rest_gt)
+        print(
+            f"ECE after  {calibration_type}  — "
+            f"calibration set ({n_cal}): {ece_cal_after:.4f}  "
+            f"training set ({n - n_cal}): {ece_train_after:.4f}"
+        )
+
+        def _calibrate_example(ex):
+            p = float(np.clip(ex["soft_label"][1], 1e-7, 1 - 1e-7))
+            logit = np.log(p / (1 - p))
+            probs = clf.predict_proba([[logit]])[0]  # [P(0), P(1)]
+            return {"soft_label": [float(probs[0]), float(probs[1])]}
+
+    elif calibration_type == "isotonic":
+        p_pos = np.clip(cal_soft[:, 1], 1e-7, 1 - 1e-7)
+        ir = IsotonicRegression(out_of_bounds="clip")
+        ir.fit(p_pos, cal_gt)
+
+        def _calibrate_soft(raw: np.ndarray) -> np.ndarray:
+            p = np.clip(raw[:, 1], 1e-7, 1 - 1e-7)
+            p_cal = ir.predict(p)
+            return np.column_stack([1 - p_cal, p_cal])
+
+        ece_cal_after = _compute_ece(_calibrate_soft(cal_soft), cal_gt)
+        ece_train_after = _compute_ece(_calibrate_soft(rest_soft), rest_gt)
+        print(
+            f"ECE after  {calibration_type}  — "
+            f"calibration set ({n_cal}): {ece_cal_after:.4f}  "
+            f"training set ({n - n_cal}): {ece_train_after:.4f}"
+        )
+
+        def _calibrate_example(ex):
+            p = float(np.clip(ex["soft_label"][1], 1e-7, 1 - 1e-7))
+            p_cal = float(ir.predict([p])[0])
+            return {"soft_label": [1.0 - p_cal, p_cal]}
+
+    calibrated_ds = rest_ds.map(_calibrate_example, load_from_cache_file=False)
+    print(f"Calibration complete: training on {len(calibrated_ds)}/{n} examples")
+    ece_stats = {
+        "ece_cal_before": float(ece_cal_before),
+        "ece_train_before": float(ece_train_before),
+        "ece_cal_after": float(ece_cal_after),
+        "ece_train_after": float(ece_train_after),
+    }
+    return calibrated_ds, ece_stats
 
 
 def _score_examples(
@@ -256,6 +365,13 @@ def main(
     # fraction by uncertainty), discarding weak labels for the remaining examples.
     # Requires al_strategy to be set.
     al_gt_only: bool = False,
+    # Calibration: fit a calibration model on a subset of training data, then train on
+    # the calibrated remaining subset. Requires weak labels.
+    # Choices: platt
+    calibration_type: Optional[str] = None,
+    # Fraction of training examples to use for fitting the calibration model.
+    # These examples are NOT included in the training set (held out for calibration only).
+    calibration_ratio: float = 0.1,
 ):
     # this is per device!
     if minibatch_size_per_device is None:
@@ -275,6 +391,14 @@ def main(
         assert al_strategy is not None, "n_al_rounds > 1 requires --al_strategy"
     if al_from_scratch or al_gt_only:
         assert al_strategy is not None, "al_from_scratch and al_gt_only require --al_strategy"
+    if calibration_type is not None:
+        assert calibration_type in VALID_CALIBRATION_TYPES, \
+            f"calibration_type must be one of {VALID_CALIBRATION_TYPES}"
+        assert al_strategy is None, "calibration_type is not supported together with al_strategy"
+        assert weak_labels_path is not None or weak_model_size is not None, \
+            "calibration requires weak labels (--weak_labels_path or --weak_model_size)"
+        assert 0.0 < calibration_ratio < 1.0, \
+            f"calibration_ratio must be in (0, 1), got {calibration_ratio}"
 
     assert ds_name in VALID_DATASETS, f"Unknown dataset {ds_name} not in {VALID_DATASETS}"
     assert (
@@ -315,6 +439,9 @@ def main(
         "eval_every": eval_every,
         # "sweep_subfolder": sweep_subfolder,
     }
+    if calibration_type is not None:
+        config["calibration_type"] = calibration_type
+        config["calibration_ratio"] = calibration_ratio
     if mix_ratio is not None:
         config["mix_ratio"] = mix_ratio
         if al_strategy is not None:
@@ -332,7 +459,8 @@ def main(
         weak_model_config = config.copy()
         weak_model_config["model_size"] = weak_model_size
         weak_model_config["loss"] = "xent"
-        del weak_model_config["mix_ratio"]
+        if "mix_ratio" in weak_model_config:
+            del weak_model_config["mix_ratio"]
         if "mix_selection" in weak_model_config:
             del weak_model_config["mix_selection"]
         if "al_strategy" in weak_model_config:
@@ -341,6 +469,10 @@ def main(
             del weak_model_config["n_al_rounds"]
         if "al_gt_only" in weak_model_config:
             del weak_model_config["al_gt_only"]
+        if "calibration_type" in weak_model_config:
+            del weak_model_config["calibration_type"]
+        if "calibration_ratio" in weak_model_config:
+            del weak_model_config["calibration_ratio"]
         if use_default_lr:
             weak_model_config["lr"] = MODELS_DICT[weak_model_size].default_lr
 
@@ -429,6 +561,7 @@ def main(
     if train2_ds:
         train2_ds = tokenize_dataset(train2_ds, tokenizer, max_ctx)
     loss_fn = loss_dict[loss]
+    calibration_ece = None
 
     if al_strategy is not None:
         # AL path: score → label top-k → train, repeated n_al_rounds times.
@@ -525,6 +658,8 @@ def main(
                 print(f"  Round {round_idx + 1}/{n_al_rounds} accuracy: {round_acc:.4f}")
 
     else:
+        if calibration_type is not None:
+            train1_ds, calibration_ece = _apply_calibration(train1_ds, calibration_type, calibration_ratio, seed)
         # No AL: tokenize and train directly.
         train1_ds = tokenize_dataset(train1_ds, tokenizer, max_ctx)
         print(f"Training model model, size {model_size}")
@@ -555,6 +690,8 @@ def main(
 
     acc = np.mean([x["acc"] for x in test_results])
     res_dict = {"accuracy": acc}
+    if calibration_ece is not None:
+        res_dict.update(calibration_ece)
     print("accuracy:", acc)
 
     with open(os.path.join(save_path, "config.json"), "w") as f:

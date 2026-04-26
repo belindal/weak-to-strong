@@ -105,6 +105,8 @@ def _get_save_path(
     mix_selection: str | None = None,
     al_strategy: str | None = None,
     n_al_rounds: int = 1,
+    al_from_scratch: bool = False,
+    al_gt_only: bool = False,
 ) -> str:
     """Replicate train_simple's config → folder-name logic to find the results JSON."""
     mc = MODELS_DICT[model_size]
@@ -131,6 +133,10 @@ def _get_save_path(
             config["al_strategy"] = al_strategy
             if n_al_rounds > 1:
                 config["n_al_rounds"] = n_al_rounds
+            if al_from_scratch:
+                config["al_from_scratch"] = True
+            if al_gt_only:
+                config["al_gt_only"] = True
         elif mix_selection is not None:
             config["mix_selection"] = mix_selection
     if weak_model_size is not None:
@@ -195,6 +201,10 @@ def sweep(
     train_weak: bool = True,
     # Set False to skip Phase 2 (mix + baseline runs, e.g. already completed).
     train_transfer: bool = True,
+    # Control: score and train AL from the base pretrained model (no w2s init).
+    al_from_scratch: bool = False,
+    # Control: train only on the GT-labeled fraction, drop weak labels for the rest.
+    al_gt_only: bool = False,
 ):
     ds_names = _to_list(ds_names)
     weak_model_sizes = _to_list(weak_model_sizes)
@@ -318,23 +328,28 @@ def sweep(
         for al_strat in al_strats:
             for n_rounds in n_al_rounds_list:
                 rounds_tag = f" r{n_rounds}" if n_rounds > 1 else ""
+                ctrl_tag = ("/from_scratch" if al_from_scratch else "") + ("/gt_only" if al_gt_only else "")
                 al_jobs.append({
                     "model_size": strong_size,
                     "weak_size": weak_size,
                     "ds": ds,
                     "seed": seed,
-                    "selection": f"strong_active/{al_strat}",
+                    "selection": f"strong_active/{al_strat}{ctrl_tag}",
                     "al_strategy": al_strat,
                     "n_al_rounds": n_rounds,
-                    "label": f"AL {ds} {weak_size}→{strong_size} {al_strat}{rounds_tag} s{seed}",
+                    "al_from_scratch": al_from_scratch,
+                    "al_gt_only": al_gt_only,
+                    "label": f"AL {ds} {weak_size}→{strong_size} {al_strat}{ctrl_tag}{rounds_tag} s{seed}",
                     "cmd": _build_cmd(
                         model_size=strong_size,
-                        weak_model_size=weak_size,
+                        weak_model_size=weak_size if not al_from_scratch else None,
                         ds_name=ds,
                         seed=seed,
                         mix_ratio=mix_ratio,
                         al_strategy=al_strat,
                         n_al_rounds=n_rounds if n_rounds > 1 else None,
+                        al_from_scratch=al_from_scratch if al_from_scratch else None,
+                        al_gt_only=al_gt_only if al_gt_only else None,
                         **common,
                     ),
                 })
@@ -366,6 +381,8 @@ def sweep(
             mix_selection=j["selection"] if j["al_strategy"] is None else None,
             al_strategy=j["al_strategy"],
             n_al_rounds=j.get("n_al_rounds", 1),
+            al_from_scratch=bool(j.get("al_from_scratch", False)),
+            al_gt_only=bool(j.get("al_gt_only", False)),
             **save_path_kwargs,
         )
         weak_save_path = _get_save_path(

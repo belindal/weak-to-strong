@@ -155,7 +155,7 @@ def _score_examples(
 
 def _score_pool(
     model_config: "ModelConfig",
-    checkpoint: str,
+    checkpoint: Optional[str],
     ds,
     eval_batch_size: int,
 ):
@@ -169,14 +169,15 @@ def _score_pool(
         model = TransformerWithHead.from_pretrained(
             model_config.name, num_labels=2, **custom_kwargs
         ).to("cuda")
-    ckpt_bin = os.path.join(checkpoint, "pytorch_model.bin")
-    if os.path.exists(ckpt_bin):
-        state_dict = torch.load(ckpt_bin, map_location="cpu")
-        state_dict = {
-            k.replace("transformer.module", "transformer"): v
-            for k, v in state_dict.items()
-        }
-        model.load_state_dict(state_dict, strict=False)
+    if checkpoint is not None:
+        ckpt_bin = os.path.join(checkpoint, "pytorch_model.bin")
+        if os.path.exists(ckpt_bin):
+            state_dict = torch.load(ckpt_bin, map_location="cpu")
+            state_dict = {
+                k.replace("transformer.module", "transformer"): v
+                for k, v in state_dict.items()
+            }
+            model.load_state_dict(state_dict, strict=False)
     scored = eval_model_acc(model, ds, eval_batch_size)
     del model
     clear_mem()
@@ -247,6 +248,14 @@ def main(
     # GT labels, trains, then re-scores the remaining unlabeled pool.
     # Requires al_strategy to be set when > 1.
     n_al_rounds: int = 1,
+    # Control: run AL starting from the base pretrained model rather than a w2s
+    # checkpoint. Useful as a baseline to isolate the benefit of w2s initialization.
+    # Requires al_strategy to be set.
+    al_from_scratch: bool = False,
+    # Control: after AL selection, train only on the GT-labeled examples (top mix_ratio
+    # fraction by uncertainty), discarding weak labels for the remaining examples.
+    # Requires al_strategy to be set.
+    al_gt_only: bool = False,
 ):
     # this is per device!
     if minibatch_size_per_device is None:
@@ -256,13 +265,16 @@ def main(
     if al_strategy is not None:
         assert al_strategy in VALID_AL_STRATEGIES, f"al_strategy must be one of {VALID_AL_STRATEGIES}"
         assert mix_ratio is not None, "al_strategy requires --mix_ratio to set the GT-label budget"
-        assert weak_labels_path is not None or weak_model_size is not None, \
-            "al_strategy requires weak labels (--weak_labels_path or --weak_model_size)"
+        if not al_from_scratch:
+            assert weak_labels_path is not None or weak_model_size is not None, \
+                "al_strategy requires weak labels (--weak_labels_path or --weak_model_size)"
         if al_strategy == "disagreement":
             assert weak_labels_path is not None or weak_model_size is not None, \
                 "al_strategy='disagreement' requires weak labels to compare against"
     if n_al_rounds > 1:
         assert al_strategy is not None, "n_al_rounds > 1 requires --al_strategy"
+    if al_from_scratch or al_gt_only:
+        assert al_strategy is not None, "al_from_scratch and al_gt_only require --al_strategy"
 
     assert ds_name in VALID_DATASETS, f"Unknown dataset {ds_name} not in {VALID_DATASETS}"
     assert (
@@ -309,6 +321,10 @@ def main(
             config["al_strategy"] = al_strategy
             if n_al_rounds > 1:
                 config["n_al_rounds"] = n_al_rounds
+            if al_from_scratch:
+                config["al_from_scratch"] = True
+            if al_gt_only:
+                config["al_gt_only"] = True
         else:
             config["mix_selection"] = mix_selection
 
@@ -346,15 +362,24 @@ def main(
         train1_ds, train2_ds = split_data["train"], split_data["test"]
         print("len(train1):", len(train1_ds), "len(train2):", len(train2_ds))
         config_name = get_config_foldername(config)
+        if al_strategy is not None:
+            # AL-from-scratch: annotate gt_label (absent in raw data) and reset soft_label
+            # to uniform so non-selected examples carry no supervision signal.
+            train1_ds = train1_ds.map(
+                lambda ex: {"gt_label": ex["hard_label"], "soft_label": [0.5, 0.5]},
+                load_from_cache_file=False,
+            )
     else:
         if not weak_labels_path.endswith("weak_labels"):
             weak_labels_path = weak_labels_path + "/weak_labels"
         if mix_ratio is not None:  # and mix_ratio != 1.0 and mix_ratio != 0.0:
             if al_strategy is not None:
+                init_desc = "base pretrained" if al_from_scratch else "w2s checkpoint"
+                label_desc = "GT only" if al_gt_only else f"GT + weak for remaining {1-mix_ratio:.0%}"
                 print(
-                    f"AL mix model, size {model_size}: scoring with checkpoint, "
+                    f"AL mix model, size {model_size}: init from {init_desc}, "
                     f"replacing top {mix_ratio:.0%} uncertain ({al_strategy}) with GT labels, "
-                    f"weak labels for remaining {1-mix_ratio:.0%}"
+                    f"training on {label_desc}"
                 )
             else:
                 print(
@@ -377,9 +402,10 @@ def main(
         weak_model_config = json.load(open(weak_labels_path.replace("weak_labels", "config.json")))
         config["weak_model_size"] = weak_model_config["model_size"]
         config_name = get_config_foldername(config)
-        if al_strategy is not None and resume_from_checkpoint is None:
+        if al_strategy is not None and not al_from_scratch and resume_from_checkpoint is None:
             w2s_base_config = {k: v for k, v in config.items()
-                               if k not in ("mix_ratio", "al_strategy", "mix_selection", "n_al_rounds")}
+                               if k not in ("mix_ratio", "al_strategy", "mix_selection", "n_al_rounds",
+                                            "al_from_scratch", "al_gt_only")}
             resume_from_checkpoint = os.path.join(
                 results_folder, sweep_subfolder, get_config_foldername(w2s_base_config)
             )
@@ -405,14 +431,15 @@ def main(
     if al_strategy is not None:
         # AL path: score → label top-k → train, repeated n_al_rounds times.
         # n_al_rounds=1 is the single-round case.
-        assert resume_from_checkpoint is not None, "Could not infer resume_from_checkpoint; pass it explicitly"
+        if not al_from_scratch:
+            assert resume_from_checkpoint is not None, "Could not infer resume_from_checkpoint; pass it explicitly"
         assert mix_ratio is not None
 
         train1_tok = tokenize_dataset(train1_ds, tokenizer, max_ctx)
         n_pool = len(train1_tok)
         per_round_k = max(1, round((mix_ratio / n_al_rounds) * n_pool))
         labeled_indices: set = set()
-        current_checkpoint = resume_from_checkpoint
+        current_checkpoint = None if al_from_scratch else resume_from_checkpoint
 
         if n_al_rounds > 1:
             print(
@@ -444,14 +471,21 @@ def main(
                     f"({len(labeled_indices) / n_pool:.1%}) labeled"
                 )
 
-            # Reveal GT labels for all accumulated labeled examples; weak labels remain for the rest.
-            def _reveal(ex, idx, _li=labeled_indices):
-                if idx in _li:
-                    gt = int(ex["gt_label"])
-                    return {"soft_label": [1.0 - float(gt), float(gt)]}
-                return {}
-
-            mixed_tok = train1_tok.map(_reveal, with_indices=True, load_from_cache_file=False)
+            # Reveal GT labels for accumulated labeled examples.
+            # al_gt_only: train only on labeled subset; otherwise keep weak labels for the rest.
+            if al_gt_only:
+                labeled_sorted = sorted(labeled_indices)
+                mixed_tok = train1_tok.select(labeled_sorted).map(
+                    lambda ex: {"soft_label": [1.0 - float(int(ex["gt_label"])), float(int(ex["gt_label"]))]},
+                    load_from_cache_file=False,
+                )
+            else:
+                def _reveal(ex, idx, _li=labeled_indices):
+                    if idx in _li:
+                        gt = int(ex["gt_label"])
+                        return {"soft_label": [1.0 - float(gt), float(gt)]}
+                    return {}
+                mixed_tok = train1_tok.map(_reveal, with_indices=True, load_from_cache_file=False)
 
             if n_al_rounds > 1:
                 print(f"  Training round {round_idx + 1}/{n_al_rounds}...")

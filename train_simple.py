@@ -339,6 +339,8 @@ def main(
             del weak_model_config["al_strategy"]
         if "n_al_rounds" in weak_model_config:
             del weak_model_config["n_al_rounds"]
+        if "al_gt_only" in weak_model_config:
+            del weak_model_config["al_gt_only"]
         if use_default_lr:
             weak_model_config["lr"] = MODELS_DICT[weak_model_size].default_lr
 

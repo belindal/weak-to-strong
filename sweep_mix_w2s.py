@@ -342,7 +342,7 @@ def sweep(
                     "label": f"AL {ds} {weak_size}→{strong_size} {al_strat}{ctrl_tag}{rounds_tag} s{seed}",
                     "cmd": _build_cmd(
                         model_size=strong_size,
-                        weak_model_size=weak_size if not al_from_scratch else None,
+                        weak_model_size=weak_size,  # if not al_from_scratch else None,
                         ds_name=ds,
                         seed=seed,
                         mix_ratio=mix_ratio,

@@ -467,6 +467,8 @@ def main(
             del weak_model_config["al_strategy"]
         if "n_al_rounds" in weak_model_config:
             del weak_model_config["n_al_rounds"]
+        if "al_from_scratch" in weak_model_config:
+            del weak_model_config["al_from_scratch"]
         if "al_gt_only" in weak_model_config:
             del weak_model_config["al_gt_only"]
         if "calibration_type" in weak_model_config:

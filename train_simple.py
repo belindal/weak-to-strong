@@ -127,6 +127,17 @@ VALID_LOSSES: List[str] = list(loss_dict.keys())
 
 VALID_AL_STRATEGIES = ["least_confidence", "entropy", "margin", "random", "disagreement"]
 
+# What labels to use for unlabeled examples (those not selected for GT labeling) in AL.
+#   "weak"      – keep original weak-model soft labels (default)
+#   "none"      – discard unlabeled examples; train only on GT-labeled subset
+#   "self"      – use the strong model's own predictions from the previous round
+#                 (or pretrained/w2s checkpoint predictions in round 1)
+#   "confident" – use whichever of weak / self has higher max-class probability
+#   "anneal"    – linearly interpolate: round 1 = 100% weak, round N = 100% self.
+#                 In each intermediate round, rank unlabeled examples by
+#                 |self_conf - weak_conf| and assign the top fraction to self labels.
+VALID_AL_UNLABELED = ["weak", "none", "self", "confident", "anneal"]
+
 VALID_CALIBRATION_TYPES = ["platt", "isotonic"]
 
 
@@ -361,10 +372,10 @@ def main(
     # checkpoint. Useful as a baseline to isolate the benefit of w2s initialization.
     # Requires al_strategy to be set.
     al_from_scratch: bool = False,
-    # Control: after AL selection, train only on the GT-labeled examples (top mix_ratio
-    # fraction by uncertainty), discarding weak labels for the remaining examples.
+    # What labels to use for examples NOT selected for GT labeling in each AL round.
+    # Choices: weak | none | self | confident  (see VALID_AL_UNLABELED for details).
     # Requires al_strategy to be set.
-    al_gt_only: bool = False,
+    al_unlabeled_labels: str = "weak",
     # Calibration: fit a calibration model on a subset of training data, then train on
     # the calibrated remaining subset. Requires weak labels.
     # Choices: platt
@@ -389,8 +400,10 @@ def main(
                 "al_strategy='disagreement' requires weak labels to compare against"
     if n_al_rounds > 1:
         assert al_strategy is not None, "n_al_rounds > 1 requires --al_strategy"
-    if al_from_scratch or al_gt_only:
-        assert al_strategy is not None, "al_from_scratch and al_gt_only require --al_strategy"
+    assert al_unlabeled_labels in VALID_AL_UNLABELED, \
+        f"al_unlabeled_labels must be one of {VALID_AL_UNLABELED}, instead of {al_unlabeled_labels}"
+    if al_from_scratch or al_unlabeled_labels != "weak":
+        assert al_strategy is not None, "al_from_scratch and al_unlabeled_labels require --al_strategy"
     if calibration_type is not None:
         assert calibration_type in VALID_CALIBRATION_TYPES, \
             f"calibration_type must be one of {VALID_CALIBRATION_TYPES}"
@@ -450,8 +463,8 @@ def main(
                 config["n_al_rounds"] = n_al_rounds
             if al_from_scratch:
                 config["al_from_scratch"] = True
-            if al_gt_only:
-                config["al_gt_only"] = True
+            if al_unlabeled_labels != "weak":
+                config["al_unlabeled_labels"] = al_unlabeled_labels
         else:
             config["mix_selection"] = mix_selection
 
@@ -469,8 +482,8 @@ def main(
             del weak_model_config["n_al_rounds"]
         if "al_from_scratch" in weak_model_config:
             del weak_model_config["al_from_scratch"]
-        if "al_gt_only" in weak_model_config:
-            del weak_model_config["al_gt_only"]
+        if "al_unlabeled_labels" in weak_model_config:
+            del weak_model_config["al_unlabeled_labels"]
         if "calibration_type" in weak_model_config:
             del weak_model_config["calibration_type"]
         if "calibration_ratio" in weak_model_config:
@@ -511,7 +524,13 @@ def main(
         if mix_ratio is not None:  # and mix_ratio != 1.0 and mix_ratio != 0.0:
             if al_strategy is not None:
                 init_desc = "base pretrained" if al_from_scratch else "w2s checkpoint"
-                label_desc = "GT only" if al_gt_only else f"GT + weak for remaining {1-mix_ratio:.0%}"
+                label_descs = {
+                    "none": "GT only",
+                    "self": f"GT + self-model for remaining {1-mix_ratio:.0%}",
+                    "confident": f"GT + confident(weak/self) for remaining {1-mix_ratio:.0%}",
+                    "anneal": f"GT + anneal(weak→self) for remaining {1-mix_ratio:.0%}",
+                }
+                label_desc = label_descs.get(al_unlabeled_labels, f"GT + weak for remaining {1-mix_ratio:.0%}")
                 print(
                     f"AL mix model, size {model_size}: init from {init_desc}, "
                     f"replacing top {mix_ratio:.0%} uncertain ({al_strategy}) with GT labels, "
@@ -541,7 +560,7 @@ def main(
         if al_strategy is not None and not al_from_scratch and resume_from_checkpoint is None:
             w2s_base_config = {k: v for k, v in config.items()
                                if k not in ("mix_ratio", "al_strategy", "mix_selection", "n_al_rounds",
-                                            "al_from_scratch", "al_gt_only")}
+                                            "al_from_scratch", "al_unlabeled_labels")}
             resume_from_checkpoint = os.path.join(
                 results_folder, sweep_subfolder, get_config_foldername(w2s_base_config)
             )
@@ -608,19 +627,51 @@ def main(
                     f"({len(labeled_indices) / n_pool:.1%}) labeled"
                 )
 
-            # Reveal GT labels for accumulated labeled examples.
-            # al_gt_only: train only on labeled subset; otherwise keep weak labels for the rest.
-            if al_gt_only:
+            # Reveal GT labels for labeled examples; handle unlabeled examples per al_unlabeled_labels.
+            if al_unlabeled_labels == "none":
                 labeled_sorted = sorted(labeled_indices)
                 mixed_tok = train1_tok.select(labeled_sorted).map(
                     lambda ex: {"soft_label": [1.0 - float(int(ex["gt_label"])), float(int(ex["gt_label"]))]},
                     load_from_cache_file=False,
                 )
             else:
-                def _reveal(ex, idx, _li=labeled_indices):
+                if al_unlabeled_labels in ("self", "confident"):
+                    # scored covers unlabeled_mask (pool indices not yet labeled this round).
+                    # Map each such index to the strong model's soft label from this round's scoring.
+                    _slm = {
+                        unlabeled_mask[j]: list(scored["soft_label"][j])
+                        for j in range(len(unlabeled_mask))
+                    }
+                elif al_unlabeled_labels == "anneal":
+                    # Linearly ramp self-label fraction from 0 (round 1) to 1 (round N).
+                    # Select which unlabeled examples get self labels by ranking on
+                    # |self_conf - weak_conf|: examples where the two sources disagree most
+                    # are most informative to switch.
+                    self_frac = round_idx / max(1, n_al_rounds - 1)
+                    _self_soft = np.array(scored["soft_label"])
+                    _weak_soft = np.array(unlabeled_tok["soft_label"])
+                    _diff = np.abs(np.max(_self_soft, axis=1) - np.max(_weak_soft, axis=1))
+                    n_self = round(self_frac * len(unlabeled_mask))
+                    _top_self = set(np.argsort(-_diff)[:n_self].tolist())
+                    _slm = {unlabeled_mask[j]: list(_self_soft[j]) for j in _top_self}
+                    print(
+                        f"  Anneal round {round_idx + 1}/{n_al_rounds}: "
+                        f"{self_frac:.0%} self ({n_self}/{len(unlabeled_mask)} unlabeled examples)"
+                    )
+                else:
+                    _slm = {}
+                _use_confident = al_unlabeled_labels == "confident"
+
+                def _reveal(ex, idx, _li=labeled_indices, _slm=_slm, _uc=_use_confident):
                     if idx in _li:
                         gt = int(ex["gt_label"])
                         return {"soft_label": [1.0 - float(gt), float(gt)]}
+                    if idx in _slm:
+                        self_sl = _slm[idx]
+                        if _uc:
+                            weak_sl = list(ex["soft_label"])
+                            return {"soft_label": self_sl if max(self_sl) >= max(weak_sl) else weak_sl}
+                        return {"soft_label": self_sl}
                     return {}
                 mixed_tok = train1_tok.map(_reveal, with_indices=True, load_from_cache_file=False)
 

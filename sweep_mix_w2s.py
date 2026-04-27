@@ -106,7 +106,7 @@ def _get_save_path(
     al_strategy: str | None = None,
     n_al_rounds: int = 1,
     al_from_scratch: bool = False,
-    al_gt_only: bool = False,
+    al_unlabeled_labels: str = "weak",
 ) -> str:
     """Replicate train_simple's config → folder-name logic to find the results JSON."""
     mc = MODELS_DICT[model_size]
@@ -135,8 +135,8 @@ def _get_save_path(
                 config["n_al_rounds"] = n_al_rounds
             if al_from_scratch:
                 config["al_from_scratch"] = True
-            if al_gt_only:
-                config["al_gt_only"] = True
+            if al_unlabeled_labels != "weak":
+                config["al_unlabeled_labels"] = al_unlabeled_labels
         elif mix_selection is not None:
             config["mix_selection"] = mix_selection
     if weak_model_size is not None:
@@ -203,8 +203,9 @@ def sweep(
     train_transfer: bool = True,
     # Control: score and train AL from the base pretrained model (no w2s init).
     al_from_scratch: bool = False,
-    # Control: train only on the GT-labeled fraction, drop weak labels for the rest.
-    al_gt_only: bool = False,
+    # What labels to use for unlabeled examples in each AL round.
+    # Comma-separated to sweep: e.g. "weak,self,anneal"
+    al_unlabeled_labels: Union[str, Sequence[str]] = "weak",
 ):
     ds_names = _to_list(ds_names)
     weak_model_sizes = _to_list(weak_model_sizes)
@@ -213,6 +214,7 @@ def sweep(
     selections = _to_list(mix_selections)
     al_strats = _to_list(al_strategies)
     n_al_rounds_list = [n_al_rounds] if isinstance(n_al_rounds, int) else [int(x) for x in n_al_rounds]
+    al_unlabeled_list = _to_list(al_unlabeled_labels) or ["weak"]
 
     for ds in ds_names:
         assert ds in VALID_DATASETS, f"Unknown dataset {ds!r}; valid: {list(VALID_DATASETS)}"
@@ -226,12 +228,12 @@ def sweep(
         if _size_rank(weak_size) >= _size_rank(strong_size)
     ]
     n_mix = len(configs) * len(selections)
-    n_al = len(configs) * len(al_strats) * len(n_al_rounds_list)
+    n_al = len(configs) * len(al_strats) * len(n_al_rounds_list) * len(al_unlabeled_list)
     print(
         f"Sweep: {len(configs)} configs × {len(selections)} mix selections = {n_mix} mix runs"
-        + (f", × {len(al_strats)} AL strategies = {n_al} AL runs" if al_strats else "") + "\n"
+        + (f", × {len(al_strats)} AL strategies × {len(al_unlabeled_list)} unlabeled modes = {n_al} AL runs" if al_strats else "") + "\n"
         f"  mix_ratio={mix_ratio:.0%}, selections={selections}, seeds={seeds}\n"
-        + (f"  al_strategies={al_strats}\n" if al_strats else "")
+        + (f"  al_strategies={al_strats}, al_unlabeled_labels={al_unlabeled_list}\n" if al_strats else "")
         + f"  concurrency: {SIZE_CONCURRENCY}"
     )
 
@@ -327,32 +329,36 @@ def sweep(
     for ds, weak_size, strong_size, seed in configs:
         for al_strat in al_strats:
             for n_rounds in n_al_rounds_list:
-                rounds_tag = f" r{n_rounds}" if n_rounds > 1 else ""
-                ctrl_tag = ("/from_scratch" if al_from_scratch else "") + ("/gt_only" if al_gt_only else "")
-                al_jobs.append({
-                    "model_size": strong_size,
-                    "weak_size": weak_size,
-                    "ds": ds,
-                    "seed": seed,
-                    "selection": f"strong_active/{al_strat}{ctrl_tag}",
-                    "al_strategy": al_strat,
-                    "n_al_rounds": n_rounds,
-                    "al_from_scratch": al_from_scratch,
-                    "al_gt_only": al_gt_only,
-                    "label": f"AL {ds} {weak_size}→{strong_size} {al_strat}{ctrl_tag}{rounds_tag} s{seed}",
-                    "cmd": _build_cmd(
-                        model_size=strong_size,
-                        weak_model_size=weak_size,  # if not al_from_scratch else None,
-                        ds_name=ds,
-                        seed=seed,
-                        mix_ratio=mix_ratio,
-                        al_strategy=al_strat,
-                        n_al_rounds=n_rounds if n_rounds > 1 else None,
-                        al_from_scratch=al_from_scratch if al_from_scratch else None,
-                        al_gt_only=al_gt_only if al_gt_only else None,
-                        **common,
-                    ),
-                })
+                for ul_labels in al_unlabeled_list:
+                    rounds_tag = f" r{n_rounds}" if n_rounds > 1 else ""
+                    ctrl_tag = (
+                        ("/from_scratch" if al_from_scratch else "")
+                        + (f"/{ul_labels}" if ul_labels != "weak" else "")
+                    )
+                    al_jobs.append({
+                        "model_size": strong_size,
+                        "weak_size": weak_size,
+                        "ds": ds,
+                        "seed": seed,
+                        "selection": f"strong_active/{al_strat}{ctrl_tag}",
+                        "al_strategy": al_strat,
+                        "n_al_rounds": n_rounds,
+                        "al_from_scratch": al_from_scratch,
+                        "al_unlabeled_labels": ul_labels,
+                        "label": f"AL {ds} {weak_size}→{strong_size} {al_strat}{ctrl_tag}{rounds_tag} s{seed}",
+                        "cmd": _build_cmd(
+                            model_size=strong_size,
+                            weak_model_size=weak_size,  # if not al_from_scratch else None,
+                            ds_name=ds,
+                            seed=seed,
+                            mix_ratio=mix_ratio,
+                            al_strategy=al_strat,
+                            n_al_rounds=n_rounds if n_rounds > 1 else None,
+                            al_from_scratch=al_from_scratch if al_from_scratch else None,
+                            al_unlabeled_labels=ul_labels if ul_labels != "weak" else None,
+                            **common,
+                        ),
+                    })
 
     if al_jobs:
         print(f"\nPhase 3: {len(al_jobs)} AL runs")
@@ -382,7 +388,7 @@ def sweep(
             al_strategy=j["al_strategy"],
             n_al_rounds=j.get("n_al_rounds", 1),
             al_from_scratch=bool(j.get("al_from_scratch", False)),
-            al_gt_only=bool(j.get("al_gt_only", False)),
+            al_unlabeled_labels=str(j.get("al_unlabeled_labels", "weak")),
             **save_path_kwargs,
         )
         weak_save_path = _get_save_path(
